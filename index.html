@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101719">
-<title>Meu Relógio</title>
+<title>Meu Relógio · v0.2</title>
 <style>
 :root{color-scheme:dark;font:16px system-ui,sans-serif;background:#101719;color:#f0faf6}
 *{box-sizing:border-box}body{margin:0}main{max-width:38rem;margin:auto;padding:clamp(1.25rem,6vw,3rem)}
@@ -18,6 +18,7 @@ button{border:1px solid #526a65;border-radius:.65rem;background:#243632;color:#f
 <header><h1>Meu Relógio</h1><p>Conecte seu relógio e consulte o que ele disponibiliza por Bluetooth.</p></header>
 <section aria-labelledby="connection">
 <h2 id="connection">Conexão</h2>
+<small>Versão 0.2</small>
 <p id="status" role="status">Pronto para buscar o relógio.</p>
 <div class="actions">
 <button class="primary" id="connect">Buscar e conectar</button>
@@ -35,7 +36,6 @@ button{border:1px solid #526a65;border-radius:.65rem;background:#243632;color:#f
 <script>
 const serviceId = 'cc353442-be58-4ea2-876e-11d8d6976366';
 const valueId = 'c551c36a-0377-4a29-9657-74ffb655a188';
-const otherServices = ['000001ff-3c17-d293-8e48-14fe2e4da212', 0xae00];
 const byId = id => document.getElementById(id);
 const connect = byId('connect');
 const disconnect = byId('disconnect');
@@ -49,9 +49,10 @@ let operation = 0;
 
 function reset(message) {
   operation++;
-  if (device?.gatt?.connected) device.gatt.disconnect();
-  device?.removeEventListener('gattserverdisconnected', onDisconnect);
+  const previousDevice = device;
   device = undefined;
+  previousDevice?.removeEventListener?.('gattserverdisconnected', onDisconnect);
+  if (previousDevice?.gatt?.connected) previousDevice.gatt.disconnect();
   characteristic = undefined;
   connect.disabled = false;
   disconnect.disabled = true;
@@ -65,49 +66,70 @@ function onDisconnect() {
   reset('Relógio desconectado.');
 }
 
+function describeError(error) {
+  if (typeof error === 'string' && error.trim()) return error;
+  const details = [error?.name, error?.message, error?.code ?? error?.errorCode, error?.description]
+    .filter(value => value !== undefined && value !== null && value !== '');
+  if (details.length) return details.join(' · ');
+  if (error && typeof error === 'object') {
+    const raw = JSON.stringify(error);
+    if (raw && raw !== '{}') return raw;
+  }
+  return 'O navegador não informou o motivo.';
+}
+
+function sameUUID(entry, uuid) {
+  return String(entry.uuid).toLowerCase() === uuid;
+}
+
 connect.addEventListener('click', async () => {
   const current = ++operation;
+  let stage = 'Busca Bluetooth';
+  let connected = false;
   connect.disabled = true;
   status.textContent = 'Selecione Apple Watch Ultra 1 Bor na lista.';
   try {
     device = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
-      optionalServices: [serviceId, ...otherServices],
+      optionalServices: [serviceId],
     });
-    device.addEventListener('gattserverdisconnected', onDisconnect);
+    stage = 'Conexão Bluetooth';
     status.textContent = 'Conectando…';
     const server = await device.gatt.connect();
     if (current !== operation) return;
+    connected = true;
     status.textContent = 'Conectado a ' + (device.name || 'relógio');
     disconnect.disabled = false;
-    result.textContent = 'Buscando serviço de leitura…';
+    device.addEventListener?.('gattserverdisconnected', onDisconnect);
 
-    const service = await server.getPrimaryService(serviceId);
-    const value = await service.getCharacteristic(valueId);
+    stage = 'Descoberta de serviços';
+    result.textContent = 'Buscando serviços Bluetooth…';
+    const services = await server.getPrimaryServices();
     if (current !== operation) return;
-    characteristic = value;
+    byId('services').replaceChildren(...services.map(service => {
+      const item = document.createElement('li');
+      item.textContent = service.uuid;
+      return item;
+    }));
+    details.hidden = services.length === 0;
+
+    const service = services.find(service => sameUUID(service, serviceId));
+    if (!service) throw new Error('O serviço esperado do relógio não apareceu.');
+    stage = 'Descoberta da característica de leitura';
+    const characteristics = await service.getCharacteristics();
+    if (current !== operation) return;
+    characteristic = characteristics.find(value => sameUUID(value, valueId));
+    if (!characteristic) throw new Error('A característica esperada não apareceu.');
     read.disabled = false;
     result.textContent = 'Pronto para ler.';
-    try {
-      const services = await server.getPrimaryServices();
-      if (current !== operation) return;
-      byId('services').replaceChildren(...services.map(service => {
-        const item = document.createElement('li');
-        item.textContent = service.uuid;
-        return item;
-      }));
-      details.hidden = services.length === 0;
-    } catch {
-      // A listagem é opcional quando a leitura direta está disponível.
-    }
   } catch (error) {
     if (current !== operation) return;
-    if (device?.gatt?.connected) {
-      result.textContent = 'Serviço de leitura indisponível. ' + error.message;
+    const message = stage + ' falhou. ' + describeError(error);
+    if (connected) {
+      result.textContent = message;
       return;
     }
-    reset(error.name === 'NotFoundError' ? 'Seleção cancelada ou relógio indisponível.' :
-      'Falha na conexão. ' + error.message);
+    reset(message);
   }
 });
 
@@ -125,7 +147,7 @@ read.addEventListener('click', async () => {
       ? Array.from(bytes, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ')
       : 'O relógio respondeu com um valor vazio.';
   } catch (error) {
-    if (current === operation) result.textContent = 'Falha na leitura. ' + error.message;
+    if (current === operation) result.textContent = 'Falha na leitura. ' + describeError(error);
   } finally {
     if (current === operation) read.disabled = false;
   }
