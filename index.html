@@ -3,7 +3,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101719">
-<title>Meu Relógio · v0.2</title>
+<title>Meu Relógio · v0.3</title>
 <style>
 :root{color-scheme:dark;font:16px system-ui,sans-serif;background:#101719;color:#f0faf6}
 *{box-sizing:border-box}body{margin:0}main{max-width:38rem;margin:auto;padding:clamp(1.25rem,6vw,3rem)}
@@ -18,7 +18,7 @@ button{border:1px solid #526a65;border-radius:.65rem;background:#243632;color:#f
 <header><h1>Meu Relógio</h1><p>Conecte seu relógio e consulte o que ele disponibiliza por Bluetooth.</p></header>
 <section aria-labelledby="connection">
 <h2 id="connection">Conexão</h2>
-<small>Versão 0.2</small>
+<small>Versão 0.3</small>
 <p id="status" role="status">Pronto para buscar o relógio.</p>
 <div class="actions">
 <button class="primary" id="connect">Buscar e conectar</button>
@@ -32,9 +32,16 @@ button{border:1px solid #526a65;border-radius:.65rem;background:#243632;color:#f
 <output id="result" aria-live="polite">Conecte o relógio para ler.</output>
 <details id="details" hidden><summary>Serviços encontrados</summary><ul id="services"></ul></details>
 </section>
+<section aria-labelledby="notifications">
+<h2 id="notifications">Notificações do relógio</h2>
+<div class="actions"><button id="listen" disabled>Ouvir FF03</button></div>
+<p id="notify-status" role="status">Conecte o relógio para começar.</p>
+<ol id="packets" aria-label="Últimos 10 pacotes recebidos"></ol>
+</section>
 </main>
 <script>
 const serviceId = 'cc353442-be58-4ea2-876e-11d8d6976366';
+const notifyServiceId = '000001ff-3c17-d293-8e48-14fe2e4da212';
 const valueId = 'c551c36a-0377-4a29-9657-74ffb655a188';
 const byId = id => document.getElementById(id);
 const connect = byId('connect');
@@ -43,6 +50,12 @@ const read = byId('read');
 const status = byId('status');
 const result = byId('result');
 const details = byId('details');
+const listen = byId('listen');
+const notifyStatus = byId('notify-status');
+const packets = byId('packets');
+let notifyCharacteristic;
+let listening = false;
+let packetCount = 0;
 let device;
 let characteristic;
 let operation = 0;
@@ -54,6 +67,12 @@ function reset(message) {
   previousDevice?.removeEventListener?.('gattserverdisconnected', onDisconnect);
   if (previousDevice?.gatt?.connected) previousDevice.gatt.disconnect();
   characteristic = undefined;
+  notifyCharacteristic?.removeEventListener('characteristicvaluechanged', onPacket);
+  notifyCharacteristic = undefined;
+  listening = false;
+  listen.disabled = true;
+  listen.textContent = 'Ouvir FF03';
+  notifyStatus.textContent = 'Conecte o relógio para começar.';
   connect.disabled = false;
   disconnect.disabled = true;
   read.disabled = true;
@@ -91,7 +110,7 @@ connect.addEventListener('click', async () => {
   try {
     device = await navigator.bluetooth.requestDevice({
       acceptAllDevices: true,
-      optionalServices: [serviceId],
+      optionalServices: [serviceId, notifyServiceId],
     });
     stage = 'Conexão Bluetooth';
     status.textContent = 'Conectando…';
@@ -113,6 +132,14 @@ connect.addEventListener('click', async () => {
     }));
     details.hidden = services.length === 0;
 
+    notifyCharacteristic = undefined;
+    const notifyService = services.find(service => sameUUID(service, notifyServiceId));
+    listen.disabled = !notifyService;
+    notifyStatus.textContent = notifyService
+      ? 'Toque em Ouvir FF03 para receber pacotes.'
+      : 'O serviço de notificações não apareceu.';
+    listen.onclick = notifyService ? () => toggleNotifications(notifyService) : null;
+
     const service = services.find(service => sameUUID(service, serviceId));
     if (!service) throw new Error('O serviço esperado do relógio não apareceu.');
     stage = 'Descoberta da característica de leitura';
@@ -133,6 +160,63 @@ connect.addEventListener('click', async () => {
   }
 });
 
+function toHex(value) {
+  const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return Array.from(bytes, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+function onPacket(event) {
+  const value = event.target.value;
+  if (!value || event.target !== notifyCharacteristic) return;
+  packetCount++;
+  const item = document.createElement('li');
+  item.textContent = new Date().toLocaleTimeString('pt-BR') + ' · ' +
+    value.byteLength + ' bytes · ' + (toHex(value) || 'Pacote vazio');
+  packets.prepend(item);
+  if (packets.children.length > 10) packets.lastElementChild.remove();
+  notifyStatus.textContent = 'Pacotes recebidos nesta escuta: ' + packetCount;
+}
+
+async function toggleNotifications(service) {
+  const current = operation;
+  listen.disabled = true;
+  try {
+    if (listening) {
+      await notifyCharacteristic.stopNotifications();
+      if (current !== operation) return;
+      notifyCharacteristic.removeEventListener('characteristicvaluechanged', onPacket);
+      listening = false;
+      listen.textContent = 'Ouvir FF03';
+      notifyStatus.textContent = 'Escuta encerrada. Pacotes recebidos: ' + packetCount;
+      return;
+    }
+
+    notifyStatus.textContent = 'Ativando notificações…';
+    const characteristics = await service.getCharacteristics();
+    if (current !== operation) return;
+    notifyCharacteristic = characteristics.find(entry =>
+      sameUUID(entry, 'ff03') || sameUUID(entry, '0000ff03-0000-1000-8000-00805f9b34fb'));
+    if (!notifyCharacteristic) throw new Error('O canal FF03 não apareceu.');
+
+    packetCount = 0;
+    packets.replaceChildren();
+    notifyCharacteristic.addEventListener('characteristicvaluechanged', onPacket);
+    await notifyCharacteristic.startNotifications();
+    if (current !== operation) return;
+    listening = true;
+    listen.textContent = 'Parar escuta';
+    if (!packetCount) notifyStatus.textContent = 'Escutando FF03. Aguardando pacotes…';
+  } catch (error) {
+    if (current !== operation) return;
+    if (!listening) {
+      notifyCharacteristic?.removeEventListener('characteristicvaluechanged', onPacket);
+    }
+    notifyStatus.textContent = 'Falha na escuta FF03. ' + describeError(error);
+  } finally {
+    if (current === operation) listen.disabled = false;
+  }
+}
+
 disconnect.addEventListener('click', onDisconnect);
 
 read.addEventListener('click', async () => {
@@ -142,9 +226,8 @@ read.addEventListener('click', async () => {
   try {
     const value = await characteristic.readValue();
     if (current !== operation) return;
-    const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    result.textContent = bytes.length
-      ? Array.from(bytes, byte => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ')
+    result.textContent = value.byteLength
+      ? toHex(value)
       : 'O relógio respondeu com um valor vazio.';
   } catch (error) {
     if (current === operation) result.textContent = 'Falha na leitura. ' + describeError(error);
